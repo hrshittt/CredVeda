@@ -1,0 +1,103 @@
+# model_training.py
+"""
+Model training script for the Credit Intelligence Platform.
+
+This script performs the following steps:
+1. Loads the historical feature data from the SQLite database.
+2. Creates the forward-looking target variable (will the stock return be positive
+   in the next N days?).
+3. Selects the features defined in the config file.
+4. Performs simple imputation for missing values.
+5. Scales the features using StandardScaler.
+6. Trains a RandomForestClassifier model.
+7. Saves the trained model and the scaler to disk using joblib for later use in scoring.
+"""
+import sqlite3
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+import joblib
+import config
+
+def train_model():
+    """Loads data, trains the model, and saves it."""
+    try:
+        conn = sqlite3.connect(config.DB_NAME)
+        # Load all historical data for training
+        df = pd.read_sql_query("SELECT * FROM historical_features", conn, index_col=['Date', 'Ticker'], parse_dates=['Date'])
+        print(f"Loaded {len(df)} rows from the database.")
+    except Exception as e:
+        print(f"Could not load data from database: {e}")
+        return
+    finally:
+        if conn:
+            conn.close()
+
+    # --- 1. Create the Predictive Target ---
+    print(f"Creating predictive target for a {config.PREDICTION_HORIZON_DAYS}-day horizon...")
+    # Use groupby('Ticker') to calculate future returns independently for each stock
+    df['Future_Close'] = df.groupby(level='Ticker')['Close'].shift(-config.PREDICTION_HORIZON_DAYS)
+    df['Future_Return'] = (df['Future_Close'] / df['Close']) - 1.0
+    # The target is 1 if the future return is positive, 0 otherwise
+    df['Target'] = (df['Future_Return'] > 0).astype(int)
+
+    # Drop rows where we couldn't calculate a future return (the most recent data)
+    df.dropna(subset=['Target'], inplace=True)
+    print(f"Training data size after creating target: {len(df)} rows.")
+
+    # --- 2. Feature Selection and Imputation ---
+    # Filter for features defined in config, ensuring they exist in the dataframe
+    feature_cols = [col for col in config.FEATURE_COLS if col in df.columns]
+    print(f"\nUsing the following {len(feature_cols)} features for training:\n{feature_cols}")
+
+    X = df[feature_cols].copy()
+    y = df['Target']
+
+    # Simple imputation: fill numeric NaNs with the median of that column
+    for col in X.columns:
+        if X[col].dtype.kind in 'biufc' and X[col].isnull().any():
+            median_val = X[col].median()
+            X[col].fillna(median_val, inplace=True)
+            print(f"Imputed NaNs in '{col}' with median value {median_val:.2f}")
+
+    # Final check for any remaining NaNs
+    if X.isnull().sum().sum() > 0:
+        print("[WARN] NaNs still exist after imputation. Filling with 0.")
+        X.fillna(0, inplace=True)
+
+
+    # --- 3. Scale Features ---
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    # --- 4. Train/Test Split and Model Training ---
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_scaled, y, test_size=0.2, random_state=42, stratify=y
+    )
+    
+    print(f"\nTraining model on {len(X_train)} samples...")
+    model = RandomForestClassifier(
+        n_estimators=200,      # A good number of trees
+        max_depth=10,          # Prevents overfitting
+        min_samples_split=5,
+        min_samples_leaf=3,
+        random_state=42,
+        n_jobs=-1,             # Use all available CPU cores
+        class_weight='balanced' # Helps with imbalanced classes
+    )
+    model.fit(X_train, y_train)
+
+    # Evaluate the model (optional but good practice)
+    accuracy = model.score(X_test, y_test)
+    print(f"Model training complete. Test Accuracy: {accuracy:.2%}")
+
+    # --- 5. Save the Model and Scaler ---
+    joblib.dump(model, 'model.joblib')
+    joblib.dump(scaler, 'scaler.joblib')
+    joblib.dump(feature_cols, 'feature_cols.joblib') # Save the feature list too!
+    print("Model, scaler, and feature list have been saved to disk.")
+
+if __name__ == "__main__":
+    train_model()

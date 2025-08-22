@@ -1,0 +1,310 @@
+# app.py
+import os
+import math
+import time
+import warnings
+from typing import Dict, Any, List, Tuple
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+import shap
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# --------- CONFIG ---------
+
+TICKERS = [
+    # Indian Large Caps (NSE)
+    "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","ICICIBANK.NS","KOTAKBANK.NS","ITC.NS",
+    "AXISBANK.NS","BAJFINANCE.NS","ADANIENT.NS",
+
+    # Original US Mega Caps
+    "AAPL","MSFT","GOOGL","GOOG","AMZN","TSLA","META","NVDA","JPM","JNJ","V",
+    "PG","UNH","HD","MA","XOM","BAC","PFE","KO","PEP","DIS",
+
+    # Extra US companies you listed
+    "MMM","AOS","ABT","ABBV","ACN","ADBE","AMD","AES","AFL","A","APD","ABNB","AKAM","ALB","ARE","ALGN",
+    "ALLE","LNT","ALL","MO","AMCR","AEE","AEP","AXP","AIG","AMT","AWK","AMP","AME","AMGN","APH","ADI",
+    "AON","APA","APO","AMAT","APTV","ACGL","ADM","ANET","AJG","AIZ","T","ATO","ADSK","ADP",
+
+    # Keep previous ~50 tickers
+    "NFLX","CSCO","INTC","VZ","MRK","WMT","CVX","ABBV","NKE","ORCL","QCOM","IBM","COST","GS","MS",
+    "AMGN","MDT","DHR","BMY","HON","TXN","LLY","AVGO","C","PM","UNP","CAT","MCD"
+]
+
+HISTORY_PERIOD = "6mo"       # for technicals
+HISTORY_INTERVAL = "1d"
+ROLL_WINDOW_VOL = 10         # rolling window for volatility
+SMA_SHORT = 10
+SMA_LONG = 50
+RSI_PERIOD = 14
+
+OUTPUT_DIR = "output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# --------- TECHNICAL INDICATORS ---------
+def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """Wilder's RSI implementation."""
+    delta = series.diff()
+    gain = (delta.clip(lower=0)).ewm(alpha=1/period, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
+    rs = gain / (loss.replace(0, np.nan))
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def add_technicals(hist: pd.DataFrame) -> pd.DataFrame:
+    df = hist.copy()
+    df["Return"] = df["Close"].pct_change()
+    df["Volatility"] = df["Return"].rolling(ROLL_WINDOW_VOL).std()
+    df[f"SMA_{SMA_SHORT}"] = df["Close"].rolling(SMA_SHORT).mean()
+    df[f"SMA_{SMA_LONG}"] = df["Close"].rolling(SMA_LONG).mean()
+    df["TrendRatio"] = df[f"SMA_{SMA_SHORT}"] / df[f"SMA_{SMA_LONG}"]
+    df["RSI"] = compute_rsi(df["Close"], RSI_PERIOD)
+    df["Liquidity"] = df["Volume"]
+    # 6M (period) total return
+    if len(df) > 1:
+        df["SixM_Return"] = (df["Close"] / df["Close"].iloc[0]) - 1.0
+    else:
+        df["SixM_Return"] = np.nan
+    return df
+
+# --------- FUNDAMENTALS (robust getter across yfinance versions) ---------
+def safe_get_info(tkr: yf.Ticker) -> Dict[str, Any]:
+    info = {}
+    try:
+        # Newer yfinance
+        info = tkr.get_info()
+    except Exception:
+        try:
+            # Older yfinance
+            info = tkr.info
+        except Exception:
+            info = {}
+    return info or {}
+
+def extract_fundamentals(info: Dict[str, Any]) -> Dict[str, Any]:
+    # Use .get(...) to be resilient to missing keys
+    return {
+        "PE": info.get("trailingPE"),
+        "PB": info.get("priceToBook"),
+        "PEG": info.get("pegRatio"),
+        "DebtToEquity": info.get("debtToEquity"),
+        "Revenue": info.get("totalRevenue"),
+        "NetIncome": info.get("netIncomeToCommon"),
+        "MarketCap": info.get("marketCap"),
+        "Beta": info.get("beta"),
+        "ProfitMargin": info.get("profitMargins"),
+        "FreeCashFlow": info.get("freeCashflow"),
+        # A couple of nice-to-haves (won’t always be present)
+        "CurrentRatio": info.get("currentRatio"),
+        "ReturnOnAssets": info.get("returnOnAssets"),
+        "ReturnOnEquity": info.get("returnOnEquity"),
+        "OperatingMargins": info.get("operatingMargins"),
+    }
+
+# --------- DATASET BUILD ---------
+def fetch_one_ticker_row(ticker: str) -> Dict[str, Any]:
+    """
+    Returns a single feature row per ticker (latest date),
+    mixing technicals (latest) + fundamentals (point-in-time).
+    """
+    try:
+        tk = yf.Ticker(ticker)
+        hist = tk.history(period=HISTORY_PERIOD, interval=HISTORY_INTERVAL, auto_adjust=False)
+        if hist is None or hist.empty:
+            return {}
+        tech = add_technicals(hist).dropna().copy()
+        if tech.empty:
+            return {}
+
+        latest = tech.iloc[-1].to_dict()
+
+        info = safe_get_info(tk)
+        fundamentals = extract_fundamentals(info)
+
+        row = {
+            "Ticker": ticker,
+            # Technicals
+            "Return": latest.get("Return"),
+            "Volatility": latest.get("Volatility"),
+            "SMA_Short": latest.get(f"SMA_{SMA_SHORT}"),
+            "SMA_Long": latest.get(f"SMA_{SMA_LONG}"),
+            "TrendRatio": latest.get("TrendRatio"),
+            "RSI": latest.get("RSI"),
+            "Liquidity": latest.get("Liquidity"),
+            "SixM_Return": latest.get("SixM_Return"),
+            "Close": latest.get("Close"),
+        }
+        row.update(fundamentals)
+
+        return row
+    except Exception as e:
+        print(f"[WARN] {ticker}: {e}")
+        return {}
+
+def build_feature_table(tickers: List[str]) -> pd.DataFrame:
+    rows = []
+    for t in tickers:
+        row = fetch_one_ticker_row(t)
+        if row:
+            rows.append(row)
+        else:
+            print(f"[INFO] Skipped {t} (no data).")
+        # be nice to Yahoo (optional tiny sleep)
+        time.sleep(0.05)
+
+    df = pd.DataFrame(rows)
+    return df
+
+# --------- TRAIN + EXPLAIN ---------
+def train_model(df: pd.DataFrame) -> Tuple[RandomForestClassifier, StandardScaler, pd.DataFrame, pd.Series]:
+    """
+    We create a simple pseudo-target:
+      Good (1) if SixM_Return > 0
+      Risky (0) otherwise
+    """
+    work = df.copy()
+
+    # Feature columns (mix of technical + fundamental + liquidity)
+    feature_cols = [
+        "Return","Volatility","TrendRatio","RSI","Liquidity","SixM_Return","Close",
+        "PE","PB","PEG","DebtToEquity","Revenue","NetIncome","MarketCap","Beta",
+        "ProfitMargin","FreeCashFlow","CurrentRatio","ReturnOnAssets","ReturnOnEquity","OperatingMargins"
+    ]
+    # Keep only existing columns
+    feature_cols = [c for c in feature_cols if c in work.columns]
+
+    # Target
+    work["Target"] = (work["SixM_Return"] > 0).astype(int)
+
+    # Drop rows with missing target or all-nan features
+    work = work.dropna(subset=["Target"])
+    X = work[feature_cols].copy()
+
+    # Simple imputation: fill numeric NaNs with column medians
+    for c in feature_cols:
+        if X[c].dtype.kind in "biufc":
+            X[c] = X[c].fillna(X[c].median())
+        else:
+            X[c] = X[c].fillna(0)
+
+    y = work["Target"]
+
+    # Scale (helps RF a bit and makes SHAP more stable)
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    # Train/test split just for sanity (we’ll train on train only)
+    Xtr, Xte, ytr, yte = train_test_split(X_scaled, y, test_size=0.2, random_state=42, stratify=y)
+
+    model = RandomForestClassifier(
+        n_estimators=300,
+        max_depth=None,
+        min_samples_split=4,
+        min_samples_leaf=2,
+        random_state=42,
+        n_jobs=-1
+    )
+    model.fit(Xtr, ytr)
+
+    # Return the fitted objects and also the X (unscaled features frame) aligned with df rows
+    return model, scaler, X, work["Ticker"]
+
+def credit_scores_and_reasons(
+    model: RandomForestClassifier,
+    scaler: StandardScaler,
+    X: pd.DataFrame,
+    tickers: pd.Series,
+    topk: int = 3
+) -> pd.DataFrame:
+    """
+    Compute credit score = P(good) * 100,
+    and SHAP-based top positive/negative contributors per company.
+    """
+    # Scale X with existing scaler
+    X_scaled = scaler.transform(X)
+
+    # Prob of class 1 (good)
+    prob_good = model.predict_proba(X_scaled)[:, 1]
+    credit_score = (prob_good * 100).round(2)
+
+    # SHAP explanations
+    explainer = shap.TreeExplainer(model)
+    shap_vals = explainer.shap_values(X_scaled)
+    # For classifier, shap_values is list [class0, class1]; we use class1 ("good")
+    shap_for_good = shap_vals[1] if isinstance(shap_vals, list) else shap_vals
+    shap_for_good = np.array(shap_for_good)
+
+    feature_names = list(X.columns)
+
+    reasons = []
+    for i in range(X.shape[0]):
+        row_contrib = shap_for_good[i]
+        # pairs of (feature, contribution)
+        pairs = list(zip(feature_names, row_contrib))
+        # sort by absolute contribution
+        pairs_sorted = sorted(pairs, key=lambda p: abs(p[1]), reverse=True)
+        top = pairs_sorted[:topk]
+
+        # Create a compact human-readable reason string
+        # e.g., "Volatility: -0.12, SixM_Return: +0.08, DebtToEquity: -0.05"
+        parts = []
+        for f, v in top:
+            sign = "+" if v >= 0 else "-"
+            parts.append(f"{f}:{sign}{abs(v):.2f}")
+        reasons.append("; ".join(parts))
+
+    out = pd.DataFrame({
+        "Ticker": list(tickers),
+        "CreditScore": credit_score,
+        "TopReasons": reasons
+    })
+    return out
+
+def global_feature_importance(model: RandomForestClassifier, feature_names: List[str]) -> pd.DataFrame:
+    imp = getattr(model, "feature_importances_", None)
+    if imp is None:
+        return pd.DataFrame(columns=["Feature","Importance"])
+    df_imp = pd.DataFrame({"Feature": feature_names, "Importance": imp})
+    return df_imp.sort_values("Importance", ascending=False)
+
+# --------- MAIN PIPELINE ---------
+def main():
+    print("Building feature table...")
+    feats = build_feature_table(TICKERS)
+
+    # Save raw features (great for your dashboard/backend)
+    feats.to_csv(os.path.join(OUTPUT_DIR, "company_features.csv"), index=False)
+    print(f"✅ Saved features -> {os.path.join(OUTPUT_DIR, 'company_features.csv')}")
+
+    # Drop rows without SixM_Return (target needs this)
+    feats_model = feats.dropna(subset=["SixM_Return"]).copy()
+    if feats_model.empty:
+        print("No usable rows to train a model (SixM_Return missing). Exiting.")
+        return
+
+    model, scaler, X, tickers = train_model(feats_model)
+
+    # Company-level scores + per-company reasons
+    scores = credit_scores_and_reasons(model, scaler, X, tickers, topk=3)
+    scores = scores.sort_values("CreditScore", ascending=False).reset_index(drop=True)
+    scores.to_csv(os.path.join(OUTPUT_DIR, "company_scores.csv"), index=False)
+    print(f"✅ Saved scores -> {os.path.join(OUTPUT_DIR, 'company_scores.csv')}")
+
+    # Global feature importance
+    feat_imp = global_feature_importance(model, list(X.columns))
+    feat_imp.to_csv(os.path.join(OUTPUT_DIR, "feature_importance.csv"), index=False)
+    print(f"✅ Saved feature importance -> {os.path.join(OUTPUT_DIR, 'feature_importance.csv')}")
+
+    # Quick preview
+    print("\nTop 10 companies by CreditScore:")
+    print(scores.head(10).to_string(index=False))
+    print("\nGlobal Feature Importance (top 10):")
+    print(feat_imp.head(10).to_string(index=False))
+
+if __name__ == "__main__":
+    main()

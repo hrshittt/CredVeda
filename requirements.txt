@@ -1,0 +1,12 @@
+pandas
+numpy
+yfinance
+scikit-learn
+shap
+streamlit
+pandas-datareader
+newsapi-python
+vaderSentiment
+joblib
+requests
+xgboost
